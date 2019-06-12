@@ -1,12 +1,19 @@
 import Foundation
 import AVFoundation
+import UIKit
 
 @objc(QRScanner)
 class QRScanner : CDVPlugin, AVCaptureMetadataOutputObjectsDelegate {
-    
+
+    @IBOutlet var qrDecodeLabel: UILabel!
+    @IBOutlet var detectorModeSelector: UISegmentedControl!
+
+    var detector: CIDetector?
+
     class CameraView: UIView {
         var videoPreviewLayer:AVCaptureVideoPreviewLayer?
-        
+        var qrCodeFrameView = UIView()
+
         func interfaceOrientationToVideoOrientation(_ orientation : UIInterfaceOrientation) -> AVCaptureVideoOrientation {
             switch (orientation) {
             case UIInterfaceOrientation.portrait:
@@ -24,23 +31,34 @@ class QRScanner : CDVPlugin, AVCaptureMetadataOutputObjectsDelegate {
 
         override func layoutSubviews() {
             super.layoutSubviews();
-            if let sublayers = self.layer.sublayers {
-                for layer in sublayers {
-                    layer.frame = self.bounds;
-                }
-            }
-            
+
+            //            if let sublayers = self.layer.sublayers {
+            //                for layer in sublayers {
+            //                    layer.frame = self.bounds;
+            //                }
+            //            }
+
             self.videoPreviewLayer?.connection?.videoOrientation = interfaceOrientationToVideoOrientation(UIApplication.shared.statusBarOrientation);
         }
-        
-        
+
+        //        override func viewDidLayoutSubviews() {
+        //            super.viewDidLayoutSubViews();
+        //
+        //            let newView = UIView(frame: CGRect(x: 100, y: 100, width: 100, height: 100))
+        ////            newView.addConstraints(iBag.constraints)
+        //            newView.backgroundColor = UIColor.red
+        //            CameraView.addSubview(newView)
+        //
+        //        }
+
+
         func addPreviewLayer(_ previewLayer:AVCaptureVideoPreviewLayer?) {
             previewLayer!.videoGravity = AVLayerVideoGravity.resizeAspectFill
             previewLayer!.frame = self.bounds
             self.layer.addSublayer(previewLayer!)
             self.videoPreviewLayer = previewLayer;
         }
-        
+
         func removePreviewLayer() {
             if self.videoPreviewLayer != nil {
                 self.videoPreviewLayer!.removeFromSuperlayer()
@@ -48,6 +66,8 @@ class QRScanner : CDVPlugin, AVCaptureMetadataOutputObjectsDelegate {
             }
         }
     }
+
+    var qrCodeLayer: CAShapeLayer = CAShapeLayer()
 
     var cameraView: CameraView!
     var captureSession:AVCaptureSession?
@@ -89,6 +109,8 @@ class QRScanner : CDVPlugin, AVCaptureMetadataOutputObjectsDelegate {
         NotificationCenter.default.addObserver(self, selector: #selector(pageDidLoad), name: NSNotification.Name.CDVPageDidLoad, object: nil)
         self.cameraView = CameraView(frame: CGRect(x: 0, y: 0, width: UIScreen.main.bounds.width, height: UIScreen.main.bounds.height))
         self.cameraView.autoresizingMask = [.flexibleWidth, .flexibleHeight];
+
+        qrCodeLayer = CAShapeLayer()
     }
 
     func sendErrorCode(command: CDVInvokedUrlCommand, error: QRScannerError){
@@ -231,20 +253,92 @@ class QRScanner : CDVPlugin, AVCaptureMetadataOutputObjectsDelegate {
         }
     }
 
+    ////
+    ////
+    //// METADATAOUTPUT
+    //// --------------
+    ////
+    ////
     // This method processes metadataObjects captured by iOS.
-    func metadataOutput(_ captureOutput: AVCaptureMetadataOutput, didOutput metadataObjects: [AVMetadataObject], from connection: AVCaptureConnection) {
-        if metadataObjects.count == 0 || scanning == false {
+    func metadataOutput(_ output: AVCaptureMetadataOutput, didOutput metadataObjects: [AVMetadataObject], from connection: AVCaptureConnection) {
+        //        let rectangleView = UIView(frame: CGRect.zero)
+        //
+        //        if let viewWithTag = cameraView.viewWithTag(100) {
+        //            viewWithTag.removeFromSuperview()
+        //        }
+
+        qrCodeLayer.removeFromSuperlayer()
+
+        if metadataObjects.count == 0 {
+            let pluginResult = CDVPluginResult(status: CDVCommandStatus_OK, messageAs: "")
             // while nothing is detected, or if scanning is false, do nothing.
-            return
+            //            rectangleView.frame = CGRect.zero
+            return commandDelegate!.send(pluginResult, callbackId: nextScanningCommand?.callbackId!)
         }
         let found = metadataObjects[0] as! AVMetadataMachineReadableCodeObject
         if found.type == AVMetadataObject.ObjectType.qr && found.stringValue != nil {
-            scanning = false
-            let pluginResult = CDVPluginResult(status: CDVCommandStatus_OK, messageAs: found.stringValue)
-            commandDelegate!.send(pluginResult, callbackId: nextScanningCommand?.callbackId!)
-            nextScanningCommand = nil
+            guard let barCodeObject = cameraView.videoPreviewLayer?.transformedMetadataObject(for: found) as? AVMetadataMachineReadableCodeObject else {
+                return
+            }
+            updateQRCodeLayer(barCodeObject.corners)
+            cameraView.layer.addSublayer(qrCodeLayer)
+            cameraView.setNeedsDisplay()
+
+            //            cameraView.addSubview(rectangleView)
+            //            cameraView.bringSubviewToFront(rectangleView)
+
+            let result = QRCodeDataString(coords: barCodeObject.corners, text: found.stringValue)
+            if let jsonData = try? JSONEncoder().encode(result),
+                let jsonString = String(data: jsonData, encoding: .utf8) {
+                let pluginResult = CDVPluginResult(status: CDVCommandStatus_OK, messageAs: jsonString)
+                commandDelegate!.send(pluginResult, callbackId: nextScanningCommand?.callbackId!)
+            }
+            //            nextScanningCommand = nil
         }
     }
+
+    // ----------------------- IMAGE QRCODE DETECTION -----------------------
+
+    func performQRCodeDetection(_ image: CIImage) -> (outImage: CIImage?, decode: String) {
+        var resultImage: CIImage?
+        var decode = ""
+        if let detector = detector {
+            let features = detector.features(in: image)
+            for feature in features as! [CIQRCodeFeature] {
+                resultImage = drawHighlightOverlayForPoints(image, topLeft: feature.topLeft, topRight: feature.topRight,
+                                                            bottomLeft: feature.bottomLeft, bottomRight: feature.bottomRight)
+                decode = feature.messageString!
+            }
+        }
+        return (resultImage, decode)
+    }
+
+    func prepareRectangleDetector() -> CIDetector {
+        let options: [String: Any] = [CIDetectorAccuracy: CIDetectorAccuracyHigh, CIDetectorAspectRatio: 1.0]
+        return CIDetector(ofType: CIDetectorTypeRectangle, context: nil, options: options)!
+    }
+
+    func prepareQRCodeDetector() -> CIDetector {
+        let options = [CIDetectorAccuracy: CIDetectorAccuracyHigh]
+        return CIDetector(ofType: CIDetectorTypeQRCode, context: nil, options: options)!
+    }
+
+    func drawHighlightOverlayForPoints(_ image: CIImage, topLeft: CGPoint, topRight: CGPoint,
+                                       bottomLeft: CGPoint, bottomRight: CGPoint) -> CIImage {
+        var overlay = CIImage(color: CIColor(red: 1.0, green: 0, blue: 0, alpha: 0.5))
+        overlay = overlay.cropped(to: image.extent)
+        overlay = overlay.applyingFilter("CIPerspectiveTransformWithExtent",
+                                         parameters: [
+                                            "inputExtent": CIVector(cgRect: image.extent),
+                                            "inputTopLeft": CIVector(cgPoint: topLeft),
+                                            "inputTopRight": CIVector(cgPoint: topRight),
+                                            "inputBottomLeft": CIVector(cgPoint: bottomLeft),
+                                            "inputBottomRight": CIVector(cgPoint: bottomRight)
+            ])
+        return overlay.composited(over: image)
+    }
+
+    // ----------------------- IMAGE QRCODE DETECTION -----------------------
 
     @objc func pageDidLoad() {
         self.webView?.isOpaque = false
@@ -374,8 +468,11 @@ class QRScanner : CDVPlugin, AVCaptureMetadataOutputObjectsDelegate {
     }
 
     @objc func destroy(_ command: CDVInvokedUrlCommand) {
-        self.makeOpaque()
         if(self.captureSession != nil){
+            self.makeOpaque()
+            //            self.cameraView.subviews.forEach({ $0.removeFromSuperview() })
+            qrCodeLayer.removeFromSuperlayer()
+
             backgroundThread(delay: 0, background: {
                 self.captureSession!.stopRunning()
                 self.cameraView.removePreviewLayer()
@@ -385,6 +482,7 @@ class QRScanner : CDVPlugin, AVCaptureMetadataOutputObjectsDelegate {
                 self.currentCamera = 0
                 self.frontCamera = nil
                 self.backCamera = nil
+                self.getStatus(command)
             }, completion: {
                 self.getStatus(command)
             })
@@ -469,14 +567,14 @@ class QRScanner : CDVPlugin, AVCaptureMetadataOutputObjectsDelegate {
     @objc func openSettings(_ command: CDVInvokedUrlCommand) {
         if #available(iOS 10.0, *) {
             guard let settingsUrl = URL(string: UIApplication.openSettingsURLString) else {
-            return
-        }
-        if UIApplication.shared.canOpenURL(settingsUrl) {
-            UIApplication.shared.open(settingsUrl, completionHandler: { (success) in
-                self.getStatus(command)
-            })
-        } else {
-            self.sendErrorCode(command: command, error: QRScannerError.open_settings_unavailable)
+                return
+            }
+            if UIApplication.shared.canOpenURL(settingsUrl) {
+                UIApplication.shared.open(settingsUrl, completionHandler: { (success) in
+                    self.getStatus(command)
+                })
+            } else {
+                self.sendErrorCode(command: command, error: QRScannerError.open_settings_unavailable)
             }
         } else {
             // pre iOS 10.0
@@ -487,5 +585,29 @@ class QRScanner : CDVPlugin, AVCaptureMetadataOutputObjectsDelegate {
                 self.sendErrorCode(command: command, error: QRScannerError.open_settings_unavailable)
             }
         }
+    }
+}
+
+extension QRScanner {
+
+    private func pathFromPoints(_ points: [CGPoint]) -> UIBezierPath? {
+        let path: UIBezierPath = UIBezierPath()
+        guard let first = points.first else {
+            return nil
+        }
+        path.move(to: first)
+        for i in 1..<points.count {
+            path.addLine(to: points[i])
+        }
+        path.addLine(to: first)
+        return path
+    }
+
+    func updateQRCodeLayer(_ points: [CGPoint])
+    {
+        qrCodeLayer.path = pathFromPoints(points)?.cgPath
+        qrCodeLayer.strokeColor = UIColor.green.cgColor
+        qrCodeLayer.fillColor = UIColor.clear.cgColor
+        qrCodeLayer.lineWidth = 2.0
     }
 }
